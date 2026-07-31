@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from datasets import build_cmapss_datasets
-from models import STPGN, STPGNConfig
+from models import STPGN, STPGNConfig, UniTSPriorAdapter
 
 
 def set_seed(seed: int) -> None:
@@ -33,13 +33,14 @@ def nasa_score(pred: torch.Tensor, target: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, units=None):
     model.eval()
     predictions, targets = [], []
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        predictions.append(model(x).squeeze(-1).cpu())
+        prior = units(x) if units is not None else None
+        predictions.append(model(x, prior).squeeze(-1).cpu())
         targets.append(y.squeeze(-1).cpu())
     pred = torch.cat(predictions)
     target = torch.cat(targets)
@@ -48,14 +49,15 @@ def evaluate(model, loader, device):
     return {"rmse": rmse, "mae": mae, "score": nasa_score(pred, target)}
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, units=None):
     model.train()
     total_loss, total_count = 0.0, 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(x)
+        prior = units(x) if units is not None else None
+        pred = model(x, prior)
         loss = criterion(pred, y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -78,7 +80,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--output-dir", default="checkpoints/stpgn_fd001")
+    parser.add_argument("--units-repo", default=None)
+    parser.add_argument("--units-checkpoint", default=None)
     args = parser.parse_args()
+
+    if bool(args.units_repo) != bool(args.units_checkpoint):
+        parser.error("--units-repo and --units-checkpoint must be provided together")
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,6 +103,14 @@ def main():
     train_loader = DataLoader(datasets["train"], shuffle=True, **loader_kwargs)
     val_loader = DataLoader(datasets["val"], shuffle=False, **loader_kwargs)
     test_loader = DataLoader(datasets["test"], shuffle=False, **loader_kwargs)
+
+    units = None
+    if args.units_repo:
+        units = UniTSPriorAdapter(
+            units_repo=args.units_repo,
+            checkpoint=args.units_checkpoint,
+            channels=21,
+        ).to(device)
 
     model = STPGN(STPGNConfig(
         in_channels=21,
@@ -126,8 +141,8 @@ def main():
     best_rmse = float("inf")
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device)
-        val_metrics = evaluate(model, val_loader, device)
+            model, train_loader, optimizer, criterion, device, units)
+        val_metrics = evaluate(model, val_loader, device, units)
         scheduler.step(val_metrics["rmse"])
         print(
             f"epoch={epoch:03d} loss={train_loss:.5f} "
@@ -146,7 +161,7 @@ def main():
 
     checkpoint = torch.load(output_dir / "best.pt", map_location=device)
     model.load_state_dict(checkpoint["model"])
-    test_metrics = evaluate(model, test_loader, device)
+    test_metrics = evaluate(model, test_loader, device, units)
     print("best validation:", checkpoint["val_metrics"])
     print("test:", test_metrics)
     with (output_dir / "test_metrics.json").open("w", encoding="utf-8") as f:

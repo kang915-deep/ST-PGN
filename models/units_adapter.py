@@ -96,8 +96,14 @@ class UniTSPriorAdapter(nn.Module):
         ]
         if not prompt_keys:
             return
-        prompt = torch.stack([state[key].float() for key in prompt_keys]).mean(dim=0)
-        prompt = prompt.mean(dim=1, keepdim=True).repeat(1, self.channels, 1, 1)
+        # Different pretraining datasets have different variable counts
+        # (e.g. 111 and 321), so reduce each prompt across its own channel
+        # dimension before averaging datasets.
+        prompt = torch.stack([
+            state[key].float().mean(dim=1, keepdim=True)
+            for key in prompt_keys
+        ]).mean(dim=0)
+        prompt = prompt.repeat(1, self.channels, 1, 1)
         target = self.model.prompt_tokens["CMAPSS"]
         target.copy_(prompt.to(dtype=target.dtype, device=target.device))
 

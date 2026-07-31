@@ -81,9 +81,9 @@ class UniTSPriorAdapter(nn.Module):
         incompatible = model.load_state_dict(state, strict=False)
         self.missing_keys = list(incompatible.missing_keys)
         self.unexpected_keys = list(incompatible.unexpected_keys)
+        self.model = model
         self._initialize_cmapss_prompt(state)
 
-        self.model = model
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()

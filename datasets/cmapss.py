@@ -109,6 +109,7 @@ class CMapssDataset(Dataset):
         seed: int = 42,
         sensor_indices: Optional[Sequence[int]] = None,
         test_last_only: bool = True,
+        last_only: bool = False,
     ):
         super().__init__()
         subset = subset.upper()
@@ -128,6 +129,7 @@ class CMapssDataset(Dataset):
         self.rul_max = rul_max
         self.sensor_cols = _sensor_columns(sensor_indices)
         self.test_last_only = test_last_only
+        self.last_only = last_only
 
         train_path = self.root / f"train_{subset}.txt"
         test_path = self.root / f"test_{subset}.txt"
@@ -155,6 +157,8 @@ class CMapssDataset(Dataset):
             raise ValueError("stats must be supplied for validation/test datasets")
         self.stats = stats
         self.samples: List[Tuple[np.ndarray, float]] = []
+        self.sample_units: List[int] = []
+        self.sample_cycles: List[int] = []
 
         for unit in sorted(df["unit"].unique()):
             unit_df = df[df["unit"] == unit].sort_values("cycle")
@@ -163,12 +167,17 @@ class CMapssDataset(Dataset):
             labels = unit_df["rul"].to_numpy(dtype=np.float32)
             if len(unit_df) < window_size:
                 continue
-            end_positions = [len(unit_df) - 1] if (
-                split == "test" and test_last_only
-            ) else range(window_size - 1, len(unit_df))
+            use_last_only = (split == "test" and test_last_only) or (
+                split == "val" and last_only
+            )
+            end_positions = [len(unit_df) - 1] if use_last_only else range(
+                window_size - 1, len(unit_df)
+            )
             for end in end_positions:
                 start = end - window_size + 1
                 self.samples.append((features[start:end + 1], float(labels[end])))
+                self.sample_units.append(int(unit))
+                self.sample_cycles.append(int(unit_df.iloc[end]["cycle"]))
 
         if not self.samples:
             raise ValueError(
@@ -193,6 +202,7 @@ def build_cmapss_datasets(
     seed: int = 42,
     sensor_indices: Optional[Sequence[int]] = None,
     test_last_only: bool = True,
+    val_last_only: bool = True,
 ) -> Dict[str, CMapssDataset]:
     """Build train/validation/test datasets sharing train-only statistics."""
     train = CMapssDataset(
@@ -202,6 +212,7 @@ def build_cmapss_datasets(
     val = CMapssDataset(
         root, subset, "val", window_size, rul_max, stats=train.stats,
         val_ratio=val_ratio, seed=seed, sensor_indices=sensor_indices,
+        last_only=val_last_only,
     )
     test = CMapssDataset(
         root, subset, "test", window_size, rul_max, stats=train.stats,

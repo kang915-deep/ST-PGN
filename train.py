@@ -8,11 +8,49 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from datasets import build_cmapss_datasets
 from models import STPGN, STPGNConfig, UniTSPriorAdapter
 from visualize_results import save_experiment_plots
+
+
+class PhysicsInformedLoss(nn.Module):
+    """Composite loss combining MSE, asymmetric penalty, and monotonicity
+    regularization for physics-informed RUL prediction.
+
+    Args:
+        alpha: Weight for the asymmetric loss term (late predictions penalized
+            more heavily than early ones, critical for aviation safety).
+        beta: Weight for the monotonicity regularization term (RUL should
+            decrease over successive time windows).
+    """
+
+    def __init__(self, alpha: float = 0.3, beta: float = 0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def asymmetric_loss(self, pred, target):
+        diff = pred - target
+        return torch.where(diff < 0,
+                           torch.exp(-diff / 13.0) - 1.0,  # late prediction: heavy penalty
+                           torch.exp(diff / 10.0) - 1.0)   # early prediction: lighter
+
+    def monotonicity_loss(self, rul_sequence):
+        # rul_sequence: [B, N] per-patch RUL estimates
+        # Penalize any increase in RUL over successive patches
+        if rul_sequence is None:
+            return torch.tensor(0.0)
+        violations = F.relu(rul_sequence[:, 1:] - rul_sequence[:, :-1])
+        return violations.mean()
+
+    def forward(self, pred, target, rul_sequence=None):
+        mse = F.mse_loss(pred, target)
+        asym = self.asymmetric_loss(pred, target).mean()
+        mono = self.monotonicity_loss(rul_sequence)
+        return mse + self.alpha * asym + self.beta * mono
 
 
 def set_seed(seed: int) -> None:
@@ -59,7 +97,7 @@ def evaluate(model, loader, device, units=None, return_details=False):
     return metrics
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, units=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, units=None, use_physics_loss=False):
     model.train()
     total_loss, total_count = 0.0, 0
     for x, y in loader:
@@ -67,8 +105,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device, units=None):
         y = y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         prior = units(x) if units is not None else None
-        pred = model(x, prior)
-        loss = criterion(pred, y)
+
+        if use_physics_loss:
+            pred, aux = model(x, prior, return_aux=True)
+            rul_seq = aux.get("rul_sequence")
+            loss = criterion(pred, y, rul_sequence=rul_seq)
+        else:
+            pred = model(x, prior)
+            loss = criterion(pred, y)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -101,6 +146,31 @@ def main():
         "--val-last-only", action="store_true",
         help="use one final window per validation engine; default uses all windows",
     )
+
+    # --- ST-PGN v2 arguments ---
+    parser.add_argument("--loss-type", choices=["mse", "physics"], default="physics",
+                        help="loss function: plain MSE or physics-informed composite loss")
+    parser.add_argument("--loss-alpha", type=float, default=0.3,
+                        help="weight for asymmetric loss in physics-informed loss")
+    parser.add_argument("--loss-beta", type=float, default=0.1,
+                        help="weight for monotonicity regularization in physics-informed loss")
+    parser.add_argument("--learnable-filter", action="store_true", default=True,
+                        help="use learnable frequency domain filter (default: True)")
+    parser.add_argument("--no-learnable-filter", action="store_false", dest="learnable_filter",
+                        help="use fixed DFT hard-cutoff filter")
+    parser.add_argument("--use-cross-attention", action="store_true", default=True,
+                        help="use cross-attention for multi-scale fusion (default: True)")
+    parser.add_argument("--no-cross-attention", action="store_false", dest="use_cross_attention",
+                        help="use naive concatenation for fusion")
+    parser.add_argument("--cross-attn-heads", type=int, default=4,
+                        help="number of attention heads in cross-attention fusion")
+    parser.add_argument("--graph-topk", type=int, default=5,
+                        help="top-K sparsity for adaptive graph (0 = dense)")
+    parser.add_argument("--graph-self-loop", action="store_true", default=True,
+                        help="add learnable self-loops to adaptive graph (default: True)")
+    parser.add_argument("--no-graph-self-loop", action="store_false", dest="graph_self_loop",
+                        help="disable self-loops in adaptive graph")
+
     args = parser.parse_args()
 
     if bool(args.units_repo) != bool(args.units_checkpoint):
@@ -149,12 +219,22 @@ def main():
         padding=args.padding,
         dropout=0.1,
         head_hidden=128,
+        learnable_filter=args.learnable_filter,
+        use_cross_attention=args.use_cross_attention,
+        cross_attn_heads=args.cross_attn_heads,
+        graph_topk=args.graph_topk,
+        graph_self_loop=args.graph_self_loop,
     )).to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5)
-    criterion = nn.MSELoss()
+
+    if args.loss_type == "physics":
+        criterion = PhysicsInformedLoss(alpha=args.loss_alpha, beta=args.loss_beta)
+    else:
+        criterion = nn.MSELoss()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +246,9 @@ def main():
     history = []
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, units)
+            model, train_loader, optimizer, criterion, device, units,
+            use_physics_loss=(args.loss_type == "physics")
+        )
         val_metrics = evaluate(model, val_loader, device, units)
         scheduler.step(val_metrics["rmse"])
         print(

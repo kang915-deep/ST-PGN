@@ -98,8 +98,8 @@ def main():
     parser.add_argument("--padding", choices=["none", "replicate", "reflect"], default="none")
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument(
-        "--val-all-windows", action="store_true",
-        help="use all validation windows instead of one final window per engine",
+        "--val-last-only", action="store_true",
+        help="use one final window per validation engine; default uses all windows",
     )
     args = parser.parse_args()
 
@@ -116,7 +116,7 @@ def main():
         subset=args.subset,
         window_size=args.window_size,
         seed=args.seed,
-        val_last_only=not args.val_all_windows,
+        val_last_only=args.val_last_only,
     )
     loader_kwargs = {
         "batch_size": args.batch_size,

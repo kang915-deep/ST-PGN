@@ -202,7 +202,7 @@ def build_cmapss_datasets(
     seed: int = 42,
     sensor_indices: Optional[Sequence[int]] = None,
     test_last_only: bool = True,
-    val_last_only: bool = True,
+    val_last_only: bool = False,
 ) -> Dict[str, CMapssDataset]:
     """Build train/validation/test datasets sharing train-only statistics."""
     train = CMapssDataset(
